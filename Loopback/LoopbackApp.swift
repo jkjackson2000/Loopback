@@ -18,7 +18,8 @@ struct LoopbackApp: App {
     init() {
         UserDefaults.standard.register(defaults: [
             SettingsKey.lowBatteryAlerts: true,
-            SettingsKey.tempUnitFahrenheit: false
+            SettingsKey.tempUnitFahrenheit: false,
+            SettingsKey.imperialBodyUnits: false
         ])
     }
 
@@ -38,6 +39,9 @@ struct LoopbackApp: App {
 enum SettingsKey {
     static let lowBatteryAlerts = "settings.lowBatteryAlerts"
     static let tempUnitFahrenheit = "settings.tempUnitF"
+    /// Profile height/weight input units. false = metric (cm/kg), true = imperial (ft·in / lb).
+    /// Storage stays metric; this only affects how the profile fields are shown and entered.
+    static let imperialBodyUnits = "settings.imperialBody"
 }
 
 /// Temperature unit preference + conversion. Absolute temps get the full °C→°F conversion; a
@@ -4194,8 +4198,26 @@ struct ProfileView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft = UserProfile()
     @State private var savedTick = false
+    @AppStorage(SettingsKey.imperialBodyUnits) private var imperial = false
 
     private var connected: Bool { model.connectionState.contains("Connected") }
+
+    // Height/weight are always stored metric in `draft`; these bindings convert to/from imperial
+    // for display so the underlying profile (and the Loop's first-time-use config) stay in cm/kg.
+    private static let lbPerKg = 2.2046226218
+    private var totalInches: Int { Int((draft.heightCm / 2.54).rounded()) }
+    private var heightFeet: Binding<Int> {
+        Binding(get: { totalInches / 12 },
+                set: { draft.heightCm = Double($0 * 12 + (totalInches % 12)) * 2.54 })
+    }
+    private var heightInches: Binding<Int> {
+        Binding(get: { totalInches % 12 },
+                set: { draft.heightCm = Double((totalInches / 12) * 12 + min(max($0, 0), 11)) * 2.54 })
+    }
+    private var weightLb: Binding<Double> {
+        Binding(get: { (draft.weightKg * Self.lbPerKg).rounded() },
+                set: { draft.weightKg = $0 / Self.lbPerKg })
+    }
 
     var body: some View {
         NavigationStack {
@@ -4219,9 +4241,27 @@ struct ProfileView: View {
                                     .labelsHidden().colorScheme(.dark)
                             }
                             divider
-                            row("Height (cm)") { numberField($draft.heightCm) }
+                            row("Units") {
+                                Picker("", selection: $imperial) {
+                                    Text("cm·kg").tag(false)
+                                    Text("ft·lb").tag(true)
+                                }.pickerStyle(.segmented).frame(width: 132)
+                            }
                             divider
-                            row("Weight (kg)") { numberField($draft.weightKg) }
+                            if imperial {
+                                row("Height") {
+                                    HStack(spacing: 6) {
+                                        unitIntField(heightFeet, width: 38); unitSuffix("ft")
+                                        unitIntField(heightInches, width: 38); unitSuffix("in")
+                                    }
+                                }
+                                divider
+                                row("Weight (lb)") { numberField(weightLb) }
+                            } else {
+                                row("Height (cm)") { numberField($draft.heightCm) }
+                                divider
+                                row("Weight (kg)") { numberField($draft.weightKg) }
+                            }
                             divider
                             row("Resting HR (bpm)") { intField($draft.restingHr) }
                             divider
@@ -4302,6 +4342,18 @@ struct ProfileView: View {
             .keyboardType(.numberPad).multilineTextAlignment(.trailing)
             .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.textPrimary)
             .frame(width: 90)
+    }
+
+    /// Compact integer field for the feet/inches inputs.
+    private func unitIntField(_ value: Binding<Int>, width: CGFloat) -> some View {
+        TextField("", value: value, format: .number)
+            .keyboardType(.numberPad).multilineTextAlignment(.trailing)
+            .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.textPrimary)
+            .frame(width: width)
+    }
+
+    private func unitSuffix(_ text: String) -> some View {
+        Text(text).font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.textTertiary)
     }
 }
 
