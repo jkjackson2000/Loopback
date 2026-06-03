@@ -2816,7 +2816,6 @@ struct TodayView: View {
     @EnvironmentObject private var model: AppModel
     @State private var dayIndex = 0
     @State private var dayHR: [HeartRateSample] = []
-    @State private var showingSettings = false
     @State private var showingLog = false
     @State private var logNoteMode = false
     // Observed so temperature tiles/markers re-render when the unit preference changes.
@@ -2883,18 +2882,10 @@ struct TodayView: View {
                     showingLog = true
                 }
             }
-            .navigationTitle("")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(Theme.bg, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showingSettings = true } label: {
-                        Image(systemName: "gearshape.fill").foregroundStyle(Theme.textSecondary)
-                    }
-                }
-            }
-            .sheet(isPresented: $showingSettings) { SettingsView() }
+            // No nav bar on Today — the custom "Good morning" header is the title, so hiding the
+            // empty bar reclaims the dead space the lone gear used to create. Settings lives under
+            // the Profile tab.
+            .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showingLog) { LogSheet(noteMode: logNoteMode) }
         }
         .onAppear(perform: refreshDayHR)
@@ -2954,14 +2945,34 @@ struct TodayHeader: View {
                     .background(Theme.recoveryGreen.opacity(0.12), in: Circle())
             }
             HStack(spacing: 8) {
-                StatusPill(text: model.connectionState, systemImage: "antenna.radiowaves.left.and.right", tint: model.connectionState.contains("Connected") ? Theme.recoveryGreen : Theme.hrv)
+                StatusPill(text: statusShort, systemImage: "antenna.radiowaves.left.and.right", tint: connected ? Theme.recoveryGreen : Theme.hrv)
                 if model.showingSampleData {
                     StatusPill(text: "Sample data", systemImage: "wand.and.stars", tint: Theme.recoveryYellow)
                 }
                 if let battery = model.batteryLevel {
-                    StatusPill(text: "\(battery)%", systemImage: "battery.75percent", tint: Theme.activity)
+                    StatusPill(text: "\(battery)%", systemImage: batteryGlyph(battery), tint: Theme.activity)
                 }
             }
+        }
+    }
+
+    private var connected: Bool { model.connectionState.contains("Connected") }
+
+    /// Short, fixed-width-friendly status — the full device name lives on the Device tab.
+    private var statusShort: String {
+        let s = model.connectionState
+        if s.contains("Connected") { return "Connected" }
+        if s.contains("Reconnecting") { return "Reconnecting" }
+        if s.contains("Connecting") { return "Connecting" }
+        return "Not connected"
+    }
+
+    private func batteryGlyph(_ level: Int) -> String {
+        switch level {
+        case ..<13: return "battery.25percent"
+        case ..<38: return "battery.50percent"
+        case ..<63: return "battery.75percent"
+        default: return "battery.100percent"
         }
     }
 
