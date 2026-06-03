@@ -1,0 +1,33 @@
+{
+  "originHash" : "04b85e333a5c7140358d36ca058ef6e434a5ae78187e20ded3ba71302ba4bbbb",
+  "pins" : [
+    {
+      "identity" : "polar-ble-sdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/polarofficial/polar-ble-sdk.git",
+      "state" : {
+        "revision" : "4e9685f0dd406d2b6ddc80ccbe822b05b3ce0e3b",
+        "version" : "8.0.0"
+      }
+    },
+    {
+      "identity" : "swift-protobuf",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-protobuf.git",
+      "state" : {
+        "revision" : "f6506eaa86ed2e01cb0ae14a75035b7fdbf0918f",
+        "version" : "1.38.0"
+      }
+    },
+    {
+      "identity" : "zip",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/marmelroy/Zip.git",
+      "state" : {
+        "revision" : "67fa55813b9e7b3b9acee9c0ae501def28746d76",
+        "version" : "2.1.2"
+      }
+    }
+  ],
+  "version" : 3
+}

@@ -1,0 +1,13 @@
+.DS_Store
+build/
+build-device/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager build artifacts (Package.resolved is kept on purpose)
+.swiftpm/
+.build/
+
+# Claude Code agent state
+.claude/
