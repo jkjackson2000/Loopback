@@ -40,6 +40,21 @@ The project has **no signing team and a placeholder bundle id** (`com.example.lo
 simulator build needs zero setup. For a device build, set your own team + bundle id in Xcode
 (Signing & Capabilities). Do **not** commit a real team id or a personal bundle id back to the repo.
 
+From the command line you can sign a device build by passing your team and bundle id at build time
+(nothing committed):
+
+```bash
+xcodebuild -project Loopback.xcodeproj -scheme Loopback -configuration Debug \
+  -destination 'platform=iOS,id=<YOUR_DEVICE_UDID>' -derivedDataPath build-device \
+  DEVELOPMENT_TEAM=<YOUR_TEAM_ID> PRODUCT_BUNDLE_IDENTIFIER=<your.bundle.id> \
+  -allowProvisioningUpdates
+xcrun devicectl device install app --device <YOUR_DEVICE_UDID> \
+  build-device/Build/Products/Debug-iphoneos/Loopback.app
+```
+
+A personal, git-ignored `install-device.sh` is the convenient way to keep your own values out of the
+repo.
+
 ## Single-file layout
 
 The whole app is `Loopback/LoopbackApp.swift`, divided by `// MARK:` sections. Swift doesn't care

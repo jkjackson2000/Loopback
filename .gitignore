@@ -11,3 +11,6 @@ xcuserdata/
 
 # Claude Code agent state
 .claude/
+
+# Personal device-install helper (contains signing values)
+install-device.sh
