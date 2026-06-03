@@ -1,0 +1,7 @@
+Loopback
+Copyright (c) 2026 jkjackson2000 and Loopback contributors
+
+This product depends on the Polar BLE SDK
+(https://github.com/polarofficial/polar-ble-sdk), which is distributed under
+its own separate license. Loopback bundles none of its source; it is resolved
+at build time by Swift Package Manager. See that repository for terms.
