@@ -18,6 +18,7 @@ struct LoopbackApp: App {
     init() {
         UserDefaults.standard.register(defaults: [
             SettingsKey.lowBatteryAlerts: true,
+            SettingsKey.circadianAlerts: false,
             SettingsKey.tempUnitFahrenheit: false,
             SettingsKey.imperialBodyUnits: false
         ])
@@ -38,6 +39,7 @@ struct LoopbackApp: App {
 
 enum SettingsKey {
     static let lowBatteryAlerts = "settings.lowBatteryAlerts"
+    static let circadianAlerts = "settings.circadianAlerts"
     static let tempUnitFahrenheit = "settings.tempUnitF"
     /// Profile height/weight input units. false = metric (cm/kg), true = imperial (ft·in / lb).
     /// Storage stays metric; this only affects how the profile fields are shown and entered.
@@ -55,9 +57,8 @@ enum TempUnit {
     }
 }
 
-/// Local notifications — currently low-battery alerts for the Loop. No remote/push server; these
-/// fire on-device from BLE battery events (which keep arriving under the bluetooth-central
-/// background mode), so all data stays local.
+/// Local notifications for low-battery alerts and opt-in circadian cues. No remote/push server;
+/// everything is derived and scheduled on-device.
 enum NotificationManager {
     static func requestAuthorization() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
@@ -72,6 +73,34 @@ enum NotificationManager {
         content.sound = .default
         let request = UNNotificationRequest(identifier: "lowBattery-\(threshold)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    static func cancelCircadian() {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
+            let ids = requests.map(\.identifier).filter { $0.hasPrefix("circadian-") }
+            center.removePendingNotificationRequests(withIdentifiers: ids)
+        }
+    }
+
+    static func scheduleCircadian(_ plan: CircadianPlan) {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
+            let staleIds = requests.map(\.identifier).filter { $0.hasPrefix("circadian-") }
+            center.removePendingNotificationRequests(withIdentifiers: staleIds)
+
+            for cue in plan.notificationCues {
+                guard cue.date.timeIntervalSinceNow > 60 else { continue }
+                let content = UNMutableNotificationContent()
+                content.title = cue.title
+                content.body = cue.body
+                content.sound = .default
+                let parts = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: cue.date)
+                let trigger = UNCalendarNotificationTrigger(dateMatching: parts, repeats: false)
+                let request = UNNotificationRequest(identifier: "circadian-\(cue.id)", content: content, trigger: trigger)
+                center.add(request)
+            }
+        }
     }
 }
 
@@ -138,6 +167,8 @@ struct DailySummary: Identifiable, Codable, Equatable {
     var sleepScore: Int
     var strainScore: Int
     var sleepMinutes: Int
+    var sleepStart: Date? = nil
+    var sleepEnd: Date? = nil
     var activeMinutes: Int
     var restingHeartRate: Double
     var hrvMs: Double
@@ -152,6 +183,25 @@ struct DailySummary: Identifiable, Codable, Equatable {
     /// Ordered sleep phases for the night attributed to this day. Empty for days with no
     /// staged sleep (older rows, or activity-only days) — callers fall back gracefully.
     var sleepStages: [SleepSpan] = []
+    /// True when the displayed sleep window/duration was corrected by the user. Device-derived
+    /// rows remain untouched in SQLite; this flag only marks the effective view of the day.
+    var sleepAdjusted: Bool = false
+    var rawSleepScore: Int? = nil
+    var rawSleepMinutes: Int? = nil
+    var rawSleepStart: Date? = nil
+    var rawSleepEnd: Date? = nil
+}
+
+struct SleepCorrection: Identifiable, Codable, Equatable {
+    var id: String { dayKey }
+    var dayKey: String
+    var sleepStart: Date
+    var sleepEnd: Date
+    var updatedAt: Date = .now
+
+    var durationMinutes: Int {
+        max(0, Int((sleepEnd.timeIntervalSince(sleepStart) / 60).rounded()))
+    }
 }
 
 struct HeartRateSample: Identifiable, Codable, Equatable {
@@ -209,6 +259,7 @@ struct SyncPayload: Codable, Equatable {
     var dailySummaries: [DailySummary]
     var heartRateSamples: [HeartRateSample]
     var journalEntries: [JournalEntry] = []
+    var sleepCorrections: [SleepCorrection] = []
     /// Human-readable per-fetch breakdown for on-device debugging (persisted to sync_log
     /// so it can be pulled off the device — NSLog isn't visible on a real phone).
     var diagnostics: String = ""
@@ -271,6 +322,7 @@ final class AppModel: ObservableObject {
     @Published var healthWriteStatus: String?
     @Published var profile = UserProfile()
     @Published var hasProfile = false
+    @Published var circadianPlan: CircadianPlan?
     /// nil = unknown/not checked, true/false = device's first-time-use state.
     @Published var ftuDone: Bool?
     @Published var isSettingUpDevice = false
@@ -415,6 +467,7 @@ final class AppModel: ObservableObject {
 
     /// Re-arm reconnection when the app returns to the foreground.
     func onForeground() {
+        refreshCircadianPlan()
         autoReconnectIfPossible()
     }
 
@@ -459,6 +512,7 @@ final class AppModel: ObservableObject {
                 try store.insertSyncLog(message: "Synced \(payload.dailySummaries.count) days, \(payload.heartRateSamples.count) HR — \(payload.diagnostics)")
                 summaries = try store.fetchDailySummaries(limit: 90)
                 journalEntries = try store.fetchJournalEntries(limit: 100)
+                refreshCircadianPlan()
                 showingSampleData = false
                 awaitingFirstSync = false
                 lastSyncText = Date.now.shortDateTime
@@ -476,6 +530,39 @@ final class AppModel: ObservableObject {
             journalEntries = try store.fetchJournalEntries(limit: 100)
         } catch {
             alertText = "Journal save failed: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func saveSleepCorrection(dayKey: String, sleepStart: Date, sleepEnd: Date) -> Bool {
+        let minutes = Int((sleepEnd.timeIntervalSince(sleepStart) / 60).rounded())
+        guard minutes >= 90, minutes <= 16 * 60 else {
+            alertText = "Sleep correction should be between 1h 30m and 16h."
+            return false
+        }
+        do {
+            try store.save(SleepCorrection(dayKey: dayKey, sleepStart: sleepStart, sleepEnd: sleepEnd))
+            summaries = try store.fetchDailySummaries(limit: 90)
+            refreshCircadianPlan()
+            try? store.insertSyncLog(message: "Sleep correction saved for \(dayKey): \(minutes)m")
+            return true
+        } catch {
+            alertText = "Sleep correction failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    @discardableResult
+    func resetSleepCorrection(dayKey: String) -> Bool {
+        do {
+            try store.deleteSleepCorrection(dayKey: dayKey)
+            summaries = try store.fetchDailySummaries(limit: 90)
+            refreshCircadianPlan()
+            try? store.insertSyncLog(message: "Sleep correction reset for \(dayKey)")
+            return true
+        } catch {
+            alertText = "Could not reset sleep correction: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -660,6 +747,7 @@ final class AppModel: ObservableObject {
             try store.seedIfNeeded()
             summaries = try store.fetchDailySummaries(limit: 90)
             journalEntries = try store.fetchJournalEntries(limit: 100)
+            refreshCircadianPlan()
             let source = (try store.getMeta("data_source")) ?? "sample"
             showingSampleData = (source == "sample")
             awaitingFirstSync = (source == "awaiting")
@@ -691,6 +779,7 @@ final class AppModel: ObservableObject {
             try store.clearSampleData()
             summaries = try store.fetchDailySummaries(limit: 90)
             journalEntries = try store.fetchJournalEntries(limit: 100)
+            refreshCircadianPlan()
             showingSampleData = false
             awaitingFirstSync = summaries.isEmpty
             try store.setMeta("data_source", value: summaries.isEmpty ? "awaiting" : "real")
@@ -703,6 +792,32 @@ final class AppModel: ObservableObject {
     /// debuggable off-device (NSLog isn't visible on a real phone). HR/battery spam excluded.
     private func logEvent(_ message: String) {
         try? store.insertSyncLog(message: "EVT \(message)")
+    }
+
+    func updateCircadianAlerts(enabled: Bool) {
+        if enabled {
+            NotificationManager.requestAuthorization()
+            scheduleCircadianIfNeeded()
+        } else {
+            NotificationManager.cancelCircadian()
+        }
+    }
+
+    private func refreshCircadianPlan() {
+        circadianPlan = CircadianEngine.plan(summaries: summaries)
+        scheduleCircadianIfNeeded()
+    }
+
+    private func scheduleCircadianIfNeeded() {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.circadianAlerts) else {
+            NotificationManager.cancelCircadian()
+            return
+        }
+        guard let circadianPlan else {
+            NotificationManager.cancelCircadian()
+            return
+        }
+        NotificationManager.scheduleCircadian(circadianPlan)
     }
 
     private func apply(_ event: PolarClientEvent) {
@@ -975,7 +1090,7 @@ enum MetricKind: String, CaseIterable, Identifiable {
         case .recharge:
             return "Recharge estimates how recovered your body is, blending overnight HRV, resting heart rate, skin temperature, and sleep against your own recent baseline. Higher means your body is more ready for load."
         case .sleep:
-            return "Sleep Score rates last night against an ~8h target using total time asleep, consistency, and how broken the night was. It rewards long, unbroken, regular sleep."
+            return "Sleep Score rates last night using total time asleep, regular timing, and how broken the night was. It rewards long, unbroken, regular sleep without treating stage labels as medical truth."
         case .exertion:
             return "Exertion is a 0–21 daily load estimate built from active minutes and how hard your heart worked, weighting vigorous effort more. Use it to balance hard and easy days."
         case .hrv:
@@ -992,44 +1107,62 @@ enum MetricKind: String, CaseIterable, Identifiable {
 
 final class MetricsEngine {
     static func recoveryScore(today: DailySummary, history: [DailySummary]) -> Int {
-        // History is accumulated oldest-first, so the trailing 21 days (suffix) are the most
-        // recent baseline — prefix would anchor to the oldest days and never move forward.
-        let baseline = history.filter { $0.dayKey != today.dayKey }.suffix(21)
-        guard baseline.count >= 5 else {
-            return clamp(Int(55 + Double(today.sleepScore - 70) * 0.25 + Double(70 - today.strainScore) * 0.15))
-        }
-        let avgHRV = baseline.map(\.hrvMs).average
-        let avgRHR = baseline.map(\.restingHeartRate).average
-        let hrvSignal = ((today.hrvMs - avgHRV) / max(avgHRV, 1)) * 35
-        let rhrSignal = ((avgRHR - today.restingHeartRate) / max(avgRHR, 1)) * 45
-        // Skin-temp only contributes once a deviation actually exists (Polar's own, or one we
-        // derive from accumulated absolute temps) — a missing value never penalizes recovery.
-        let tempSignal = effectiveTempDeviation(today: today, baseline: Array(baseline)).map { -abs($0) * 12 } ?? 0
+        // Sort defensively before taking the trailing baseline; callers do not all pass the same
+        // ordering, and recovery should always anchor to the most recent usable days.
+        let baseline = Array(history.filter { $0.dayKey != today.dayKey }.sorted { $0.dayKey < $1.dayKey }.suffix(21))
+        let hrvBaseline = baseline.map(\.hrvMs).filter { $0 > 0 }
+        let rhrBaseline = baseline.map(\.restingHeartRate).filter { $0 > 0 }
         let sleepSignal = Double(today.sleepScore - 70) * 0.25
         let strainSignal = Double(55 - today.strainScore) * 0.12
-        return clamp(Int(68 + hrvSignal + rhrSignal + tempSignal + sleepSignal + strainSignal))
+        // Skin-temp only contributes once a deviation actually exists (Polar's own, or one we
+        // derive from accumulated absolute temps) — a missing value never penalizes recovery.
+        let tempSignal = effectiveTempDeviation(today: today, baseline: baseline).map { -min(abs($0) * 12, 16) } ?? 0
+
+        guard hrvBaseline.count >= 5 || rhrBaseline.count >= 5 else {
+            var score = 55 + sleepSignal + Double(70 - today.strainScore) * 0.15 + tempSignal
+            if today.hrvMs > 0 {
+                score += bounded((today.hrvMs - 45) / 20 * 8, min: -8, max: 8)
+            }
+            if today.restingHeartRate > 0 {
+                score += bounded((62 - today.restingHeartRate) / 12 * 8, min: -8, max: 8)
+            }
+            return clamp(Int(score))
+        }
+
+        var score = 68 + sleepSignal + strainSignal + tempSignal
+        if hrvBaseline.count >= 5, today.hrvMs > 0 {
+            let avgHRV = hrvBaseline.average
+            score += bounded(((today.hrvMs - avgHRV) / max(avgHRV, 1)) * 35, min: -18, max: 18)
+        }
+        if rhrBaseline.count >= 5, today.restingHeartRate > 0 {
+            let avgRHR = rhrBaseline.average
+            score += bounded(((avgRHR - today.restingHeartRate) / max(avgRHR, 1)) * 45, min: -18, max: 18)
+        }
+        return clamp(Int(score))
     }
 
     /// Per-signal contributors behind the recovery score, each flagged in/out of its usual range,
     /// for the "X/N in range" breakdown chips. Ranges are vs. the trailing baseline when there's
     /// enough history, else simple physiological defaults.
     static func recoveryContributors(today: DailySummary, history: [DailySummary]) -> [RecoveryContributor] {
-        let baseline = history.filter { $0.dayKey != today.dayKey }.suffix(21)
-        let hasBaseline = baseline.count >= 5
-        let avgHRV = baseline.map(\.hrvMs).average
-        let avgRHR = baseline.map(\.restingHeartRate).average
+        let baseline = Array(history.filter { $0.dayKey != today.dayKey }.sorted { $0.dayKey < $1.dayKey }.suffix(21))
+        let hrvBaseline = baseline.map(\.hrvMs).filter { $0 > 0 }
+        let rhrBaseline = baseline.map(\.restingHeartRate).filter { $0 > 0 }
 
-        let hrvIn = hasBaseline ? today.hrvMs >= avgHRV * 0.9 : today.hrvMs >= 45
-        let rhrIn = hasBaseline ? today.restingHeartRate <= avgRHR * 1.06 : today.restingHeartRate <= 65
+        let hrvIn = hrvBaseline.count >= 5 ? today.hrvMs >= hrvBaseline.average * 0.9 : today.hrvMs >= 45
+        let rhrIn = rhrBaseline.count >= 5 ? today.restingHeartRate <= rhrBaseline.average * 1.06 : today.restingHeartRate <= 65
         let sleepIn = today.sleepScore >= 70
 
-        var result = [
-            RecoveryContributor(label: "HRV", value: "\(Int(today.hrvMs)) ms", inRange: hrvIn),
-            RecoveryContributor(label: "RHR", value: "\(Int(today.restingHeartRate)) bpm", inRange: rhrIn)
-        ]
+        var result: [RecoveryContributor] = []
+        if today.hrvMs > 0 {
+            result.append(RecoveryContributor(label: "HRV", value: "\(Int(today.hrvMs)) ms", inRange: hrvIn))
+        }
+        if today.restingHeartRate > 0 {
+            result.append(RecoveryContributor(label: "RHR", value: "\(Int(today.restingHeartRate)) bpm", inRange: rhrIn))
+        }
         // Include Temp only when a deviation exists (Polar's own, or one derived from our absolute
         // temps). A bare absolute reading with no baseline yet isn't shown as in/out of range.
-        if let dev = effectiveTempDeviation(today: today, baseline: Array(baseline)) {
+        if let dev = effectiveTempDeviation(today: today, baseline: baseline) {
             let tempIn = abs(dev) <= 0.4   // range check stays in °C
             let shown = TempUnit.convert(dev, isDelta: true)
             let tempStr = shown.formatted(.number.precision(.fractionLength(1)).sign(strategy: .always(includingZero: false)))
@@ -1049,11 +1182,21 @@ final class MetricsEngine {
         return todayAbs - absTemps.average
     }
 
-    static func sleepScore(durationMinutes: Int, consistencyDeltaMinutes: Int, interruptions: Int) -> Int {
-        let duration = min(Double(durationMinutes) / 480.0, 1.15) * 72
-        let consistency = max(0, 18 - Double(abs(consistencyDeltaMinutes)) * 0.25)
-        let continuity = max(0, 10 - Double(interruptions) * 1.8)
-        return clamp(Int(duration + consistency + continuity))
+    static func sleepScore(durationMinutes: Int, consistencyDeltaMinutes: Int, interruptions: Int, stages: [SleepSpan] = []) -> Int {
+        let duration = min(Double(durationMinutes) / 450.0, 1.15) * 68
+        let consistency = max(0, 16 - Double(abs(consistencyDeltaMinutes)) * 0.22)
+        let continuity = max(0, 12 - Double(interruptions) * 1.6)
+        let wakePenalty = sleepWakePenalty(stages)
+        return clamp(Int(duration + consistency + continuity - wakePenalty))
+    }
+
+    /// Absolute minutes away from the recent bedtime anchor, using circular time-of-day math so
+    /// 23:50 and 00:10 are treated as 20 minutes apart, not almost a whole day.
+    static func sleepConsistencyDeltaMinutes(sleepStart: Date?, history: [DailySummary]) -> Int {
+        guard let sleepStart else { return 0 }
+        let starts = history.sorted { $0.dayKey < $1.dayKey }.suffix(14).compactMap(\.sleepStart).map(minutesInDay)
+        guard starts.count >= 3 else { return 0 }
+        return Int(circularDistance(minutesInDay(sleepStart), circularMean(starts)).rounded())
     }
 
     static func strainScore(samples: [HeartRateSample], restingHeartRate: Double) -> Int {
@@ -1076,6 +1219,37 @@ final class MetricsEngine {
     private static func clamp(_ value: Int) -> Int {
         min(max(value, 0), 100)
     }
+
+    private static func sleepWakePenalty(_ stages: [SleepSpan]) -> Double {
+        guard !stages.isEmpty else { return 0 }
+        let total = stages.map { $0.startMin + $0.durationMin }.max() ?? 0
+        guard total > 0 else { return 0 }
+        let awake = stages.filter { $0.stage == .awake }.reduce(0) { $0 + $1.durationMin }
+        return min(8, Double(awake) / Double(total) * 30)
+    }
+
+    private static func bounded(_ value: Double, min minValue: Double, max maxValue: Double) -> Double {
+        Swift.min(Swift.max(value, minValue), maxValue)
+    }
+
+    private static func minutesInDay(_ date: Date) -> Double {
+        let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return Double((parts.hour ?? 0) * 60 + (parts.minute ?? 0))
+    }
+
+    private static func circularMean(_ minutes: [Double]) -> Double {
+        guard !minutes.isEmpty else { return 0 }
+        let angles = minutes.map { $0 / 1_440 * 2 * Double.pi }
+        let x = angles.map(cos).reduce(0, +) / Double(angles.count)
+        let y = angles.map(sin).reduce(0, +) / Double(angles.count)
+        let angle = atan2(y, x)
+        return angle >= 0 ? angle / (2 * Double.pi) * 1_440 : (angle + 2 * Double.pi) / (2 * Double.pi) * 1_440
+    }
+
+    private static func circularDistance(_ a: Double, _ b: Double) -> Double {
+        let diff = abs(a - b).truncatingRemainder(dividingBy: 1_440)
+        return min(diff, 1_440 - diff)
+    }
 }
 
 final class CoachEngine {
@@ -1092,9 +1266,14 @@ final class CoachEngine {
             reasons.append("recharge is moderate at \(today.recoveryScore)")
         }
         reasons.append("sleep was \(today.sleepMinutes / 60)h \(today.sleepMinutes % 60)m")
-        reasons.append("HRV is \(Int(today.hrvMs)) ms")
-        reasons.append("RHR is \(Int(today.restingHeartRate)) bpm")
-        if let temp = today.skinTempDeltaC, abs(temp) >= 0.5 {
+        if today.hrvMs > 0 {
+            reasons.append("HRV is \(Int(today.hrvMs)) ms")
+        }
+        if today.restingHeartRate > 0 {
+            reasons.append("RHR is \(Int(today.restingHeartRate)) bpm")
+        }
+        let older = history.filter { $0.dayKey < today.dayKey }.sorted { $0.dayKey < $1.dayKey }
+        if let temp = MetricsEngine.effectiveTempDeviation(today: today, baseline: Array(older.suffix(21))), abs(temp) >= 0.5 {
             reasons.append("skin temperature is \(temp.formatted(.number.precision(.fractionLength(1)))) C from baseline")
         }
         let action: String
@@ -1109,6 +1288,241 @@ final class CoachEngine {
     }
 }
 
+enum CircadianPhase: String, Equatable {
+    case morningAdvance, daytimeAnchor, caffeineCutoff, eveningDelayGuard, windDown, sleepWindow
+
+    var title: String {
+        switch self {
+        case .morningAdvance: return "Morning anchor"
+        case .daytimeAnchor: return "Daytime build"
+        case .caffeineCutoff: return "Caffeine cutoff"
+        case .eveningDelayGuard: return "Delay guard"
+        case .windDown: return "Wind-down"
+        case .sleepWindow: return "Sleep window"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .morningAdvance: return "sunrise.fill"
+        case .daytimeAnchor: return "sun.max.fill"
+        case .caffeineCutoff: return "cup.and.saucer.fill"
+        case .eveningDelayGuard: return "lightbulb.min.fill"
+        case .windDown: return "moon.stars.fill"
+        case .sleepWindow: return "bed.double.fill"
+        }
+    }
+}
+
+struct CircadianCue: Identifiable, Equatable {
+    let id: String
+    let date: Date
+    let title: String
+    let body: String
+    let systemImage: String
+}
+
+struct CircadianPlan: Equatable {
+    let phase: CircadianPhase
+    let detail: String
+    let confidence: String
+    let sleepStart: Date
+    let sleepEnd: Date
+    let morningLightStart: Date
+    let morningLightEnd: Date
+    let caffeineCutoff: Date
+    let windDownStart: Date
+    let nextCue: CircadianCue?
+    let notificationCues: [CircadianCue]
+}
+
+final class CircadianEngine {
+    static func plan(summaries: [DailySummary], now: Date = .now, calendar: Calendar = .current) -> CircadianPlan? {
+        let ordered = summaries.sorted { $0.dayKey > $1.dayKey }
+        let recent = Array(ordered.prefix(14))
+        let sleepStarts = recent.compactMap(\.sleepStart)
+        let sleepEnds = recent.compactMap(\.sleepEnd)
+        guard !sleepStarts.isEmpty || !sleepEnds.isEmpty else { return nil }
+
+        let sleepMinutes = recent.map(\.sleepMinutes).filter { $0 > 0 }
+        let avgSleepMinutes = sleepMinutes.isEmpty ? 450 : Int(sleepMinutes.average.rounded())
+        let wakeMinute = sleepEnds.isEmpty
+            ? shiftedMinute(circularMean(sleepStarts.map(minutesInDay)), by: avgSleepMinutes)
+            : circularMean(sleepEnds.map(minutesInDay))
+        let bedMinute = sleepStarts.isEmpty
+            ? shiftedMinute(wakeMinute, by: -avgSleepMinutes)
+            : circularMean(sleepStarts.map(minutesInDay))
+
+        let latest = ordered.first
+        let caffeineLeadHours = (latest?.sleepScore ?? 80) < 70 || (latest?.recoveryScore ?? 70) < 50 ? 8 : 6
+
+        let todayWake = date(onSameDayAs: now, minuteOfDay: wakeMinute, calendar: calendar)
+        let yesterdayWake = calendar.date(byAdding: .day, value: -1, to: todayWake) ?? todayWake
+        let todayBed = date(onSameDayAs: now, minuteOfDay: bedMinute, calendar: calendar)
+        let yesterdayBed = calendar.date(byAdding: .day, value: -1, to: todayBed) ?? todayBed
+        let tomorrowBed = calendar.date(byAdding: .day, value: 1, to: todayBed) ?? todayBed
+
+        let bedCandidates = [yesterdayBed, todayBed, tomorrowBed]
+        let currentSleep = bedCandidates
+            .map { ($0, wakeAfter(bed: $0, wakeMinute: wakeMinute, calendar: calendar)) }
+            .first { now >= $0.0 && now < $0.1 }
+        let upcomingBed = bedCandidates.first { $0 > now } ?? tomorrowBed
+        let sleepStart = currentSleep?.0 ?? upcomingBed
+        let sleepEnd = currentSleep?.1 ?? wakeAfter(bed: upcomingBed, wakeMinute: wakeMinute, calendar: calendar)
+        let isInSleepWindow = currentSleep != nil
+        let latestWake = todayWake <= now ? todayWake : yesterdayWake
+        let morningStart = isInSleepWindow ? sleepEnd : latestWake
+        let morningEnd = calendar.date(byAdding: .hour, value: 2, to: morningStart) ?? morningStart
+        let cutoff = calendar.date(byAdding: .hour, value: -caffeineLeadHours, to: upcomingBed) ?? upcomingBed
+        let eveningGuard = calendar.date(byAdding: .hour, value: -3, to: upcomingBed) ?? upcomingBed
+        let windDown = calendar.date(byAdding: .hour, value: -1, to: upcomingBed) ?? upcomingBed
+
+        let phase: CircadianPhase
+        if isInSleepWindow {
+            phase = .sleepWindow
+        } else if now < morningEnd {
+            phase = .morningAdvance
+        } else if now < cutoff {
+            phase = .daytimeAnchor
+        } else if now < eveningGuard {
+            phase = .caffeineCutoff
+        } else if now < windDown {
+            phase = .eveningDelayGuard
+        } else if now < upcomingBed {
+            phase = .windDown
+        } else {
+            phase = .sleepWindow
+        }
+
+        let detail = detail(for: phase, lowRecharge: (latest?.recoveryScore ?? 70) < 50)
+        let confidence = sleepStarts.count >= 5 && sleepEnds.count >= 5
+            ? "Based on \(min(sleepStarts.count, sleepEnds.count)) recent sleep anchors"
+            : "Estimated from limited sleep history"
+        let cues = notificationCues(
+            now: now,
+            wakeMinute: wakeMinute,
+            nextBed: upcomingBed,
+            caffeineCutoff: cutoff,
+            windDown: windDown,
+            sleepEnd: wakeAfter(bed: upcomingBed, wakeMinute: wakeMinute, calendar: calendar),
+            caffeineLeadHours: caffeineLeadHours,
+            calendar: calendar
+        )
+        return CircadianPlan(
+            phase: phase,
+            detail: detail,
+            confidence: confidence,
+            sleepStart: sleepStart,
+            sleepEnd: sleepEnd,
+            morningLightStart: morningStart,
+            morningLightEnd: morningEnd,
+            caffeineCutoff: cutoff,
+            windDownStart: windDown,
+            nextCue: cues.first,
+            notificationCues: cues
+        )
+    }
+
+    private static func detail(for phase: CircadianPhase, lowRecharge: Bool) -> String {
+        switch phase {
+        case .morningAdvance:
+            return lowRecharge
+                ? "Outdoor light helps anchor your clock. Keep movement easy while recharge is low."
+                : "Outdoor light and a short walk now help anchor an earlier, steadier day."
+        case .daytimeAnchor:
+            return "Bright light, meals, and activity fit this part of your estimated biological day."
+        case .caffeineCutoff:
+            return "Caffeine after this point is more likely to carry into your sleep window."
+        case .eveningDelayGuard:
+            return "Bright light and hard training now can push sleep timing later."
+        case .windDown:
+            return "Dim lights and lower stimulation before the estimated sleep window."
+        case .sleepWindow:
+            return "Protect darkness and keep this window quiet so the next day has a cleaner anchor."
+        }
+    }
+
+    private static func notificationCues(
+        now: Date,
+        wakeMinute: Double,
+        nextBed: Date,
+        caffeineCutoff: Date,
+        windDown: Date,
+        sleepEnd: Date,
+        caffeineLeadHours: Int,
+        calendar: Calendar
+    ) -> [CircadianCue] {
+        var morning = date(onSameDayAs: now, minuteOfDay: wakeMinute, calendar: calendar)
+        if morning <= now {
+            morning = calendar.date(byAdding: .day, value: 1, to: morning) ?? morning
+        }
+        let cues = [
+            CircadianCue(
+                id: "morning-\(morning.dayKey)",
+                date: morning,
+                title: "Morning light window",
+                body: "Get outdoor light soon after waking to anchor your circadian timing.",
+                systemImage: "sunrise.fill"
+            ),
+            CircadianCue(
+                id: "caffeine-\(caffeineCutoff.dayKey)",
+                date: caffeineCutoff,
+                title: "Caffeine cutoff",
+                body: "Your estimated sleep window starts in about \(caffeineLeadHours) hours. Consider switching to non-caffeinated options.",
+                systemImage: "cup.and.saucer.fill"
+            ),
+            CircadianCue(
+                id: "winddown-\(nextBed.dayKey)",
+                date: windDown,
+                title: "Dim-light wind-down",
+                body: "Dim bright light and keep activity easy before your estimated sleep window.",
+                systemImage: "moon.stars.fill"
+            ),
+            CircadianCue(
+                id: "wake-\(sleepEnd.dayKey)",
+                date: sleepEnd,
+                title: "Wake anchor",
+                body: "A consistent wake time plus morning light keeps the next night easier to time.",
+                systemImage: "sun.max.fill"
+            )
+        ]
+        let horizon = now.addingTimeInterval(36 * 3_600)
+        return cues.filter { $0.date > now && $0.date < horizon }.sorted { $0.date < $1.date }
+    }
+
+    private static func minutesInDay(_ date: Date) -> Double {
+        let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return Double((parts.hour ?? 0) * 60 + (parts.minute ?? 0))
+    }
+
+    private static func circularMean(_ minutes: [Double]) -> Double {
+        guard !minutes.isEmpty else { return 0 }
+        let angles = minutes.map { $0 / 1_440 * 2 * Double.pi }
+        let x = angles.map(cos).reduce(0, +) / Double(angles.count)
+        let y = angles.map(sin).reduce(0, +) / Double(angles.count)
+        let angle = atan2(y, x)
+        return angle >= 0 ? angle / (2 * Double.pi) * 1_440 : (angle + 2 * Double.pi) / (2 * Double.pi) * 1_440
+    }
+
+    private static func shiftedMinute(_ minute: Double, by delta: Int) -> Double {
+        let shifted = (minute + Double(delta)).truncatingRemainder(dividingBy: 1_440)
+        return shifted >= 0 ? shifted : shifted + 1_440
+    }
+
+    private static func date(onSameDayAs date: Date, minuteOfDay: Double, calendar: Calendar) -> Date {
+        let start = calendar.startOfDay(for: date)
+        return start.addingTimeInterval(minuteOfDay.rounded() * 60)
+    }
+
+    private static func wakeAfter(bed: Date, wakeMinute: Double, calendar: Calendar) -> Date {
+        var wake = date(onSameDayAs: bed, minuteOfDay: wakeMinute, calendar: calendar)
+        if wake <= bed {
+            wake = calendar.date(byAdding: .day, value: 1, to: wake) ?? wake
+        }
+        return wake
+    }
+}
+
 final class ExportService {
     private let store: LocalStore
 
@@ -1120,7 +1534,8 @@ final class ExportService {
         let payload = try SyncPayload(
             dailySummaries: store.fetchDailySummaries(limit: 365),
             heartRateSamples: store.fetchHeartRateSamples(limit: 5_000),
-            journalEntries: store.fetchJournalEntries(limit: 1_000)
+            journalEntries: store.fetchJournalEntries(limit: 1_000),
+            sleepCorrections: store.fetchSleepCorrections()
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1133,10 +1548,17 @@ final class ExportService {
 
     func writeDailyCSVExport() throws -> URL {
         let rows = try store.fetchDailySummaries(limit: 365)
-        var csv = "day,recovery,sleep,strain,sleep_minutes,active_minutes,rhr,hrv_ms,temp_delta_c,calories,steps\n"
+        var csv = "day,recovery,sleep,strain,sleep_minutes,sleep_start,sleep_end,active_minutes,rhr,hrv_ms,temp_delta_c,calories,steps,sleep_adjusted,raw_sleep_score,raw_sleep_minutes,raw_sleep_start,raw_sleep_end\n"
+        let iso = ISO8601DateFormatter()
         for row in rows.reversed() {
             let temp = row.skinTempDeltaC.map { "\($0)" } ?? ""
-            csv += "\(row.dayKey),\(row.recoveryScore),\(row.sleepScore),\(row.strainScore),\(row.sleepMinutes),\(row.activeMinutes),\(row.restingHeartRate),\(row.hrvMs),\(temp),\(row.calories),\(row.steps)\n"
+            let sleepStart = row.sleepStart.map { iso.string(from: $0) } ?? ""
+            let sleepEnd = row.sleepEnd.map { iso.string(from: $0) } ?? ""
+            let rawSleepScore = row.rawSleepScore.map(String.init) ?? ""
+            let rawSleepMinutes = row.rawSleepMinutes.map(String.init) ?? ""
+            let rawSleepStart = row.rawSleepStart.map { iso.string(from: $0) } ?? ""
+            let rawSleepEnd = row.rawSleepEnd.map { iso.string(from: $0) } ?? ""
+            csv += "\(row.dayKey),\(row.recoveryScore),\(row.sleepScore),\(row.strainScore),\(row.sleepMinutes),\(sleepStart),\(sleepEnd),\(row.activeMinutes),\(row.restingHeartRate),\(row.hrvMs),\(temp),\(row.calories),\(row.steps),\(row.sleepAdjusted),\(rawSleepScore),\(rawSleepMinutes),\(rawSleepStart),\(rawSleepEnd)\n"
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("loopback-daily.csv")
         try csv.data(using: .utf8)?.write(to: url, options: .atomic)
@@ -1161,6 +1583,7 @@ final class LocalStore {
         if sqlite3_open(resolvedURL.path, &db) != SQLITE_OK {
             throw AppError.message("Could not open SQLite database")
         }
+        try execute("PRAGMA busy_timeout = 5000;")
         try execute(Self.schema)
         try migrate()
     }
@@ -1169,11 +1592,12 @@ final class LocalStore {
     /// Existing rows predate the sample/real distinction, so they are treated as sample
     /// and get purged the next time a real device connects.
     private func migrate() throws {
-        // ALTER fails if the column already exists; that's expected and harmless.
-        try? execute("ALTER TABLE daily_summaries ADD COLUMN source TEXT NOT NULL DEFAULT 'sample';")
-        try? execute("ALTER TABLE heart_rate_samples ADD COLUMN source TEXT NOT NULL DEFAULT 'sample';")
-        try? execute("ALTER TABLE daily_summaries ADD COLUMN sleep_stages_json TEXT NOT NULL DEFAULT '[]';")
-        try? execute("ALTER TABLE daily_summaries ADD COLUMN skin_temp_c REAL NOT NULL DEFAULT -1000;")
+        try addColumnIfMissing(table: "daily_summaries", column: "source", definition: "source TEXT NOT NULL DEFAULT 'sample'")
+        try addColumnIfMissing(table: "heart_rate_samples", column: "source", definition: "source TEXT NOT NULL DEFAULT 'sample'")
+        try addColumnIfMissing(table: "daily_summaries", column: "sleep_stages_json", definition: "sleep_stages_json TEXT NOT NULL DEFAULT '[]'")
+        try addColumnIfMissing(table: "daily_summaries", column: "skin_temp_c", definition: "skin_temp_c REAL NOT NULL DEFAULT -1000")
+        try addColumnIfMissing(table: "daily_summaries", column: "sleep_start_ts", definition: "sleep_start_ts REAL NOT NULL DEFAULT -1")
+        try addColumnIfMissing(table: "daily_summaries", column: "sleep_end_ts", definition: "sleep_end_ts REAL NOT NULL DEFAULT -1")
     }
 
     deinit {
@@ -1187,7 +1611,12 @@ final class LocalStore {
     }
 
     func seedIfNeeded() throws {
-        guard try fetchDailySummaries(limit: 1).isEmpty else { return }
+        if !(try fetchDailySummaries(limit: 1).isEmpty) {
+            if try sampleDataMissingSleepAnchors() {
+                try clearSampleData()
+            }
+            guard try fetchDailySummaries(limit: 1).isEmpty else { return }
+        }
         let payload = MockDataFactory.payload()
         try save(payload.dailySummaries, source: "sample")
         try save(payload.heartRateSamples, source: "sample")
@@ -1227,11 +1656,22 @@ final class LocalStore {
         try execute("DELETE FROM journal_entries WHERE note = 'Mock context';")
     }
 
+    private func sampleDataMissingSleepAnchors() throws -> Bool {
+        let sql = """
+        SELECT COUNT(*) FROM daily_summaries
+        WHERE source = 'sample' AND (sleep_start_ts < 0 OR sleep_end_ts < 0);
+        """
+        return try withStatement(sql) { statement in
+            guard sqlite3_step(statement) == SQLITE_ROW else { return false }
+            return sqlite3_column_int(statement, 0) > 0
+        }
+    }
+
     func save(_ summaries: [DailySummary], source: String = "real") throws {
         let sql = """
         INSERT OR REPLACE INTO daily_summaries
-        (day_key, date_ts, recovery_score, sleep_score, strain_score, sleep_minutes, active_minutes, resting_hr, hrv_ms, skin_temp_delta_c, calories, steps, source, sleep_stages_json, skin_temp_c)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        (day_key, date_ts, recovery_score, sleep_score, strain_score, sleep_minutes, active_minutes, resting_hr, hrv_ms, skin_temp_delta_c, calories, steps, source, sleep_stages_json, skin_temp_c, sleep_start_ts, sleep_end_ts)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         let encoder = JSONEncoder()
         try transaction {
@@ -1254,6 +1694,8 @@ final class LocalStore {
                     bind(source, to: statement, index: 13)
                     bind(stagesJSON, to: statement, index: 14)
                     sqlite3_bind_double(statement, 15, summary.skinTempC ?? Self.tempUnavailableSentinel)
+                    sqlite3_bind_double(statement, 16, summary.sleepStart?.timeIntervalSince1970 ?? -1)
+                    sqlite3_bind_double(statement, 17, summary.sleepEnd?.timeIntervalSince1970 ?? -1)
                     try step(statement)
                 }
             }
@@ -1294,6 +1736,48 @@ final class LocalStore {
         }
     }
 
+    func save(_ correction: SleepCorrection) throws {
+        let sql = """
+        INSERT OR REPLACE INTO sleep_corrections
+        (day_key, sleep_start_ts, sleep_end_ts, updated_at_ts)
+        VALUES (?, ?, ?, ?);
+        """
+        try withStatement(sql) { statement in
+            bind(correction.dayKey, to: statement, index: 1)
+            sqlite3_bind_double(statement, 2, correction.sleepStart.timeIntervalSince1970)
+            sqlite3_bind_double(statement, 3, correction.sleepEnd.timeIntervalSince1970)
+            sqlite3_bind_double(statement, 4, correction.updatedAt.timeIntervalSince1970)
+            try step(statement)
+        }
+    }
+
+    func deleteSleepCorrection(dayKey: String) throws {
+        let sql = "DELETE FROM sleep_corrections WHERE day_key = ?;"
+        try withStatement(sql) { statement in
+            bind(dayKey, to: statement, index: 1)
+            try step(statement)
+        }
+    }
+
+    func fetchSleepCorrections() throws -> [SleepCorrection] {
+        let sql = """
+        SELECT day_key, sleep_start_ts, sleep_end_ts, updated_at_ts
+        FROM sleep_corrections ORDER BY day_key DESC;
+        """
+        return try withStatement(sql) { statement in
+            var rows: [SleepCorrection] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                rows.append(SleepCorrection(
+                    dayKey: columnString(statement, 0),
+                    sleepStart: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                    sleepEnd: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+                    updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+                ))
+            }
+            return rows
+        }
+    }
+
     func insertSyncLog(message: String) throws {
         let sql = "INSERT INTO sync_log (timestamp_ts, message) VALUES (?, ?);"
         try withStatement(sql) { statement in
@@ -1303,16 +1787,18 @@ final class LocalStore {
         }
     }
 
-    func fetchDailySummaries(limit: Int) throws -> [DailySummary] {
+    func fetchDailySummaries(limit: Int, applyingSleepCorrections: Bool = true) throws -> [DailySummary] {
         let sql = """
-        SELECT day_key, date_ts, recovery_score, sleep_score, strain_score, sleep_minutes, active_minutes, resting_hr, hrv_ms, skin_temp_delta_c, calories, steps, sleep_stages_json, skin_temp_c
+        SELECT day_key, date_ts, recovery_score, sleep_score, strain_score, sleep_minutes, active_minutes, resting_hr, hrv_ms, skin_temp_delta_c, calories, steps, sleep_stages_json, skin_temp_c, sleep_start_ts, sleep_end_ts
         FROM daily_summaries ORDER BY day_key DESC LIMIT ?;
         """
         let decoder = JSONDecoder()
-        return try query(sql, limit: limit) { statement in
+        let rows = try query(sql, limit: limit) { statement in
             let stagesJSON = columnString(statement, 12)
             let stages = (try? decoder.decode([SleepSpan].self, from: Data(stagesJSON.utf8))) ?? []
             let rawAbsTemp = sqlite3_column_double(statement, 13)
+            let rawSleepStart = sqlite3_column_double(statement, 14)
+            let rawSleepEnd = sqlite3_column_double(statement, 15)
             return DailySummary(
                 dayKey: columnString(statement, 0),
                 date: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
@@ -1320,6 +1806,8 @@ final class LocalStore {
                 sleepScore: Int(sqlite3_column_int(statement, 3)),
                 strainScore: Int(sqlite3_column_int(statement, 4)),
                 sleepMinutes: Int(sqlite3_column_int(statement, 5)),
+                sleepStart: rawSleepStart > 0 ? Date(timeIntervalSince1970: rawSleepStart) : nil,
+                sleepEnd: rawSleepEnd > 0 ? Date(timeIntervalSince1970: rawSleepEnd) : nil,
                 activeMinutes: Int(sqlite3_column_int(statement, 6)),
                 restingHeartRate: sqlite3_column_double(statement, 7),
                 hrvMs: sqlite3_column_double(statement, 8),
@@ -1330,6 +1818,38 @@ final class LocalStore {
                 sleepStages: stages
             )
         }
+        guard applyingSleepCorrections else { return rows }
+        let corrections = Dictionary(uniqueKeysWithValues: try fetchSleepCorrections().map { ($0.dayKey, $0) })
+        guard !corrections.isEmpty else { return rows }
+        return applySleepCorrections(to: rows, corrections: corrections)
+    }
+
+    private func applySleepCorrections(to rows: [DailySummary], corrections: [String: SleepCorrection]) -> [DailySummary] {
+        var adjustedAscending: [DailySummary] = []
+        for raw in rows.sorted(by: { $0.dayKey < $1.dayKey }) {
+            var day = raw
+            if let correction = corrections[raw.dayKey], correction.durationMinutes > 0 {
+                day.rawSleepScore = raw.sleepScore
+                day.rawSleepMinutes = raw.sleepMinutes
+                day.rawSleepStart = raw.sleepStart
+                day.rawSleepEnd = raw.sleepEnd
+                day.sleepAdjusted = true
+                day.sleepStart = correction.sleepStart
+                day.sleepEnd = correction.sleepEnd
+                day.sleepMinutes = correction.durationMinutes
+                let consistency = MetricsEngine.sleepConsistencyDeltaMinutes(sleepStart: correction.sleepStart, history: adjustedAscending)
+                let interruptions = raw.sleepStages.filter { $0.stage == .awake && $0.durationMin >= 2 }.count
+                day.sleepScore = MetricsEngine.sleepScore(
+                    durationMinutes: day.sleepMinutes,
+                    consistencyDeltaMinutes: consistency,
+                    interruptions: interruptions,
+                    stages: raw.sleepStages
+                )
+                day.recoveryScore = MetricsEngine.recoveryScore(today: day, history: adjustedAscending)
+            }
+            adjustedAscending.append(day)
+        }
+        return adjustedAscending.sorted { $0.dayKey > $1.dayKey }
     }
 
     func fetchHeartRateSamples(limit: Int) throws -> [HeartRateSample] {
@@ -1351,13 +1871,23 @@ final class LocalStore {
     /// Heart-rate samples that fall on a given local calendar day, oldest-first, for drawing a
     /// daily HR curve. Bounded so a long history can't return an unbounded set.
     func fetchHeartRateSamples(onDay dayKey: String, limit: Int = 600) throws -> [HeartRateSample] {
+        guard let start = Date.startOfDay(dayKey: dayKey),
+              let end = Calendar.current.date(byAdding: .day, value: 1, to: start) else {
+            return []
+        }
         let sql = """
-        SELECT id, timestamp_ts, bpm, rr_json FROM heart_rate_samples
-        WHERE id IN (SELECT id FROM heart_rate_samples ORDER BY timestamp_ts DESC LIMIT 20000)
+        SELECT id, timestamp_ts, bpm, rr_json FROM (
+            SELECT id, timestamp_ts, bpm, rr_json FROM heart_rate_samples
+            WHERE timestamp_ts >= ? AND timestamp_ts < ?
+            ORDER BY timestamp_ts DESC LIMIT ?
+        )
         ORDER BY timestamp_ts ASC;
         """
         let decoder = JSONDecoder()
-        let all = try withStatement(sql) { statement -> [HeartRateSample] in
+        return try withStatement(sql) { statement -> [HeartRateSample] in
+            sqlite3_bind_double(statement, 1, start.timeIntervalSince1970)
+            sqlite3_bind_double(statement, 2, end.timeIntervalSince1970)
+            sqlite3_bind_int(statement, 3, Int32(limit))
             var rows: [HeartRateSample] = []
             while sqlite3_step(statement) == SQLITE_ROW {
                 let rrJSON = columnString(statement, 3)
@@ -1371,7 +1901,6 @@ final class LocalStore {
             }
             return rows
         }
-        return all.filter { $0.timestamp.dayKey == dayKey }.suffix(limit).map { $0 }
     }
 
     /// Drop heart-rate samples older than `days` so live streaming can't grow the table forever.
@@ -1412,6 +1941,21 @@ final class LocalStore {
             let message = error.map { String(cString: $0) } ?? "Unknown SQLite error"
             sqlite3_free(error)
             throw AppError.message(message)
+        }
+    }
+
+    private func addColumnIfMissing(table: String, column: String, definition: String) throws {
+        guard !((try columns(in: table)).contains(column)) else { return }
+        try execute("ALTER TABLE \(table) ADD COLUMN \(definition);")
+    }
+
+    private func columns(in table: String) throws -> Set<String> {
+        try withStatement("PRAGMA table_info(\(table));") { statement in
+            var names = Set<String>()
+            while sqlite3_step(statement) == SQLITE_ROW {
+                names.insert(columnString(statement, 1))
+            }
+            return names
         }
     }
 
@@ -1488,7 +2032,9 @@ final class LocalStore {
         steps INTEGER NOT NULL,
         source TEXT NOT NULL DEFAULT 'sample',
         sleep_stages_json TEXT NOT NULL DEFAULT '[]',
-        skin_temp_c REAL NOT NULL DEFAULT -1000
+        skin_temp_c REAL NOT NULL DEFAULT -1000,
+        sleep_start_ts REAL NOT NULL DEFAULT -1,
+        sleep_end_ts REAL NOT NULL DEFAULT -1
     );
     CREATE TABLE IF NOT EXISTS heart_rate_samples (
         id TEXT PRIMARY KEY,
@@ -1510,6 +2056,12 @@ final class LocalStore {
         timestamp_ts REAL NOT NULL,
         message TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS sleep_corrections (
+        day_key TEXT PRIMARY KEY,
+        sleep_start_ts REAL NOT NULL,
+        sleep_end_ts REAL NOT NULL,
+        updated_at_ts REAL NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -1523,11 +2075,18 @@ enum MockDataFactory {
         let today = calendar.startOfDay(for: .now)
         var summaries: [DailySummary] = []
         var hrSamples: [HeartRateSample] = []
-        for offset in 0..<days {
+        for offset in (0..<days).reversed() {
             let date = calendar.date(byAdding: .day, value: -offset, to: today) ?? today
             let wave = sin(Double(offset) / 3.0)
             let sleepMinutes = 410 + Int(wave * 38) + Int.random(in: -12...12)
-            let sleepScore = MetricsEngine.sleepScore(durationMinutes: sleepMinutes, consistencyDeltaMinutes: Int(wave * 35), interruptions: max(0, Int.random(in: 0...4)))
+            let sleepEnd = date
+                .addingTimeInterval(Double(7 * 3_600 + 20 * 60))
+                .addingTimeInterval(wave * 28 * 60)
+                .addingTimeInterval(Double.random(in: -10 * 60...10 * 60))
+            let sleepStart = sleepEnd.addingTimeInterval(-Double(sleepMinutes + Int.random(in: 8...24)) * 60)
+            let consistencyDelta = MetricsEngine.sleepConsistencyDeltaMinutes(sleepStart: sleepStart, history: summaries)
+            let interruptions = max(0, Int.random(in: 0...4))
+            let sleepScore = MetricsEngine.sleepScore(durationMinutes: sleepMinutes, consistencyDeltaMinutes: consistencyDelta, interruptions: interruptions)
             let strain = 38 + Int((1 - wave) * 18) + Int.random(in: -7...9)
             let rhr = 56.0 - wave * 2.5 + Double.random(in: -1.5...1.5)
             let hrv = 62.0 + wave * 9.0 + Double.random(in: -4.0...4.0)
@@ -1539,6 +2098,8 @@ enum MockDataFactory {
                 sleepScore: sleepScore,
                 strainScore: min(max(strain, 0), 100),
                 sleepMinutes: sleepMinutes,
+                sleepStart: sleepStart,
+                sleepEnd: sleepEnd,
                 activeMinutes: 42 + Int((1 - wave) * 18),
                 restingHeartRate: rhr,
                 hrvMs: hrv,
@@ -1548,7 +2109,7 @@ enum MockDataFactory {
                 steps: 7_500 + Int((1 - wave) * 2_300)
             )
             summary.recoveryScore = MetricsEngine.recoveryScore(today: summary, history: summaries)
-            summary.sleepStages = SleepSpan.synthesize(totalMinutes: sleepMinutes, wakeCount: max(0, Int(2 - wave) + Int.random(in: 0...1)))
+            summary.sleepStages = SleepSpan.synthesize(totalMinutes: sleepMinutes, wakeCount: max(interruptions, Int(2 - wave) + Int.random(in: 0...1)))
             summaries.append(summary)
             for minute in stride(from: 0, to: 90, by: 5) {
                 let timestamp = date.addingTimeInterval(Double(7 * 3_600 + minute * 60))
@@ -1556,7 +2117,7 @@ enum MockDataFactory {
                 hrSamples.append(HeartRateSample(timestamp: timestamp, bpm: bpm, rrMs: [880, 910, 935]))
             }
         }
-        return SyncPayload(dailySummaries: summaries, heartRateSamples: hrSamples)
+        return SyncPayload(dailySummaries: summaries.reversed(), heartRateSamples: hrSamples)
     }
 }
 
@@ -1572,6 +2133,8 @@ private struct PartialDay {
     var activeMinutes: Int = 0
     var vigorousMinutes: Int = 0
     var sleepMinutes: Int = 0
+    var sleepStart: Date?
+    var sleepEnd: Date?
     var interruptions: Int = 0
     var hrvMs: Double = 0
     var restingHr: Double = 0
@@ -1924,6 +2487,8 @@ final class RealPolarBleClient: NSObject, PolarClient, PolarBleApiObserver, Pola
             let (asleepMinutes, wakeCount) = Self.sleepMinutes(sleep)
             upsert(end.dayKey) {
                 $0.date = $0.date ?? calendar.startOfDay(for: end)
+                $0.sleepStart = sleep.sleepStartTime
+                $0.sleepEnd = end
                 $0.sleepMinutes = asleepMinutes
                 $0.interruptions = wakeCount
                 $0.sleepStages = Self.sleepSpans(sleep)
@@ -1954,8 +2519,9 @@ final class RealPolarBleClient: NSObject, PolarClient, PolarBleApiObserver, Pola
         for key in byDay.keys.sorted() {
             guard let p = byDay[key], p.hasRealSignal else { continue }
             let resting = p.restingHr > 0 ? p.restingHr : p.minDayHr
+            let consistencyDelta = MetricsEngine.sleepConsistencyDeltaMinutes(sleepStart: p.sleepStart, history: summaries)
             let sleepScore = p.sleepMinutes > 0
-                ? MetricsEngine.sleepScore(durationMinutes: p.sleepMinutes, consistencyDeltaMinutes: 0, interruptions: p.interruptions)
+                ? MetricsEngine.sleepScore(durationMinutes: p.sleepMinutes, consistencyDeltaMinutes: consistencyDelta, interruptions: p.interruptions, stages: p.sleepStages)
                 : 0
             // Strain scales with active minutes, weighting vigorous activity double — it loads
             // the body more than moderate. activeMinutes already counts vigorous once, so adding
@@ -1969,6 +2535,8 @@ final class RealPolarBleClient: NSObject, PolarClient, PolarBleApiObserver, Pola
                 sleepScore: sleepScore,
                 strainScore: strain,
                 sleepMinutes: p.sleepMinutes,
+                sleepStart: p.sleepStart,
+                sleepEnd: p.sleepEnd,
                 activeMinutes: p.activeMinutes,
                 restingHeartRate: resting,
                 hrvMs: p.hrvMs,
@@ -2057,7 +2625,9 @@ final class RealPolarBleClient: NSObject, PolarClient, PolarBleApiObserver, Pola
             guard let state = phase.state else { continue }
             switch state {
             case .WAKE:
-                wakeCount += 1
+                if duration >= 120 && phaseStart > 0 && phaseEnd < totalSeconds {
+                    wakeCount += 1
+                }
             case .REM, .NONREM12, .NONREM3:
                 asleep += duration
             case .UNKNOWN:
@@ -2818,6 +3388,7 @@ struct TodayView: View {
     @State private var dayHR: [HeartRateSample] = []
     @State private var showingLog = false
     @State private var logNoteMode = false
+    @State private var editingSleep: DailySummary?
     // Observed so temperature tiles/markers re-render when the unit preference changes.
     @AppStorage(SettingsKey.tempUnitFahrenheit) private var tempF = false
 
@@ -2847,13 +3418,18 @@ struct TodayView: View {
                                 dayIndex = max(0, min(model.summaries.count - 1, dayIndex + delta))
                             }
                             HeroRings(summary: day, contributors: MetricsEngine.recoveryContributors(today: day, history: history(before: day)))
-                            SleepBreakdownCard(summary: day)
+                            SleepBreakdownCard(summary: day) {
+                                editingSleep = day
+                            }
+                            if let plan = model.circadianPlan {
+                                CircadianCard(plan: plan)
+                            }
                             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
                                 NavigationLink(value: MetricKind.hrv) {
-                                    StatTile(icon: "waveform.path.ecg", title: "HRV", value: "\(Int(day.hrvMs))", unit: "ms", caption: "Nightly average", accent: Theme.hrv)
+                                    StatTile(icon: "waveform.path.ecg", title: "HRV", value: day.hrvMs > 0 ? "\(Int(day.hrvMs))" : "—", unit: day.hrvMs > 0 ? "ms" : "", caption: day.hrvMs > 0 ? "Nightly average" : "No data yet", accent: Theme.hrv)
                                 }.buttonStyle(.plain)
                                 NavigationLink(value: MetricKind.restingHr) {
-                                    StatTile(icon: "heart.fill", title: "Resting HR", value: "\(Int(day.restingHeartRate))", unit: "bpm", caption: "Overnight low", accent: Theme.rhr)
+                                    StatTile(icon: "heart.fill", title: "Resting HR", value: day.restingHeartRate > 0 ? "\(Int(day.restingHeartRate))" : "—", unit: day.restingHeartRate > 0 ? "bpm" : "", caption: day.restingHeartRate > 0 ? "Overnight low" : "No data yet", accent: Theme.rhr)
                                 }.buttonStyle(.plain)
                                 NavigationLink(value: MetricKind.skinTemp) {
                                     StatTile(icon: "thermometer.medium", title: "Skin Temp", value: tempTile(day).value, unit: tempTile(day).unit, caption: tempTile(day).caption, accent: Theme.temp)
@@ -2887,6 +3463,7 @@ struct TodayView: View {
             // the Profile tab.
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showingLog) { LogSheet(noteMode: logNoteMode) }
+            .sheet(item: $editingSleep) { day in SleepCorrectionSheet(summary: day).environmentObject(model) }
         }
         .onAppear(perform: refreshDayHR)
         .onChange(of: dayIndex) { _, _ in refreshDayHR() }
@@ -3074,12 +3651,14 @@ struct HeroRings: View {
 /// shape (clearly captioned "estimated") only when a day has a duration but no staged phases.
 struct SleepBreakdownCard: View {
     let summary: DailySummary
+    let onEdit: () -> Void
 
     private var spans: [SleepSpan] {
         if !summary.sleepStages.isEmpty { return summary.sleepStages }
         return SleepSpan.synthesize(totalMinutes: summary.sleepMinutes, wakeCount: 0)
     }
     private var isEstimated: Bool { summary.sleepStages.isEmpty && summary.sleepMinutes > 0 }
+    private var accessory: String? { summary.sleepAdjusted ? "adjusted" : (isEstimated ? "estimated" : nil) }
     private var totalMin: Int { max(1, spans.map { $0.startMin + $0.durationMin }.max() ?? summary.sleepMinutes) }
 
     /// Minutes per stage, in display order (Awake, REM, Light, Deep).
@@ -3091,7 +3670,18 @@ struct SleepBreakdownCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            SectionHeader(title: "Sleep", accessory: isEstimated ? "estimated" : nil)
+            HStack(spacing: 10) {
+                SectionHeader(title: "Sleep", accessory: accessory)
+                Button(action: onEdit) {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Theme.sleep)
+                        .frame(width: 30, height: 30)
+                        .background(Theme.sleep.opacity(0.13), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Correct sleep")
+            }
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("\(summary.sleepMinutes / 60)")
                     .font(.system(size: 40, weight: .bold, design: .rounded)).monospacedDigit()
@@ -3127,9 +3717,200 @@ struct SleepBreakdownCard: View {
                     }
                 }
             }
+            if summary.sleepAdjusted {
+                Text("Sleep timing was corrected manually. Stages remain device-derived.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(16)
         .cardSurface(20)
+    }
+}
+
+struct SleepCorrectionSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let summary: DailySummary
+
+    @State private var sleepStart: Date
+    @State private var sleepEnd: Date
+
+    init(summary: DailySummary) {
+        self.summary = summary
+        let fallbackEnd = summary.sleepEnd
+            ?? Calendar.current.startOfDay(for: summary.date).addingTimeInterval(7 * 3_600)
+        let fallbackStart = summary.sleepStart
+            ?? fallbackEnd.addingTimeInterval(-Double(max(summary.sleepMinutes, 7 * 60)) * 60)
+        _sleepStart = State(initialValue: fallbackStart)
+        _sleepEnd = State(initialValue: fallbackEnd)
+    }
+
+    private var durationMinutes: Int {
+        max(0, Int((sleepEnd.timeIntervalSince(sleepStart) / 60).rounded()))
+    }
+
+    private var durationText: String {
+        "\(durationMinutes / 60)h \(durationMinutes % 60)m"
+    }
+
+    private var deviceWindow: String {
+        let start = summary.rawSleepStart ?? summary.sleepStart
+        let end = summary.rawSleepEnd ?? summary.sleepEnd
+        guard let start, let end else { return "No device sleep window for this day." }
+        return "\(start.formatted(.dateTime.hour().minute()))-\(end.formatted(.dateTime.hour().minute()))"
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Theme.bg.ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            SectionHeader(title: "Correct Sleep", accessory: summary.date.formatted(.dateTime.month().day()))
+                            Text("Use this when the band missed bedtime or wake time. Device vitals and staged sleep stay unchanged.")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(16)
+                        .cardSurface(20)
+
+                        VStack(alignment: .leading, spacing: 14) {
+                            SectionHeader(title: "Sleep Window", accessory: durationText)
+                            DatePicker("Start", selection: $sleepStart, displayedComponents: [.date, .hourAndMinute])
+                                .colorScheme(.dark)
+                            DatePicker("End", selection: $sleepEnd, displayedComponents: [.date, .hourAndMinute])
+                                .colorScheme(.dark)
+                        }
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .padding(16)
+                        .cardSurface(20)
+                        .onChange(of: sleepStart) { oldValue, newValue in
+                            let previousDuration = max(90, Int(sleepEnd.timeIntervalSince(oldValue) / 60))
+                            if sleepEnd <= newValue {
+                                sleepEnd = newValue.addingTimeInterval(Double(previousDuration) * 60)
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 0) {
+                            SectionHeader(title: "Device Data")
+                                .padding(.horizontal, 16)
+                                .padding(.top, 14)
+                                .padding(.bottom, 4)
+                            StatRow(label: "Device window", value: deviceWindow)
+                            Divider().overlay(Theme.hairline)
+                            StatRow(label: "Device sleep", value: "\(summary.rawSleepMinutes ?? summary.sleepMinutes) min")
+                            Divider().overlay(Theme.hairline)
+                            StatRow(label: "Device score", value: "\((summary.rawSleepScore ?? summary.sleepScore))%")
+                        }
+                        .cardSurface(20)
+
+                        PillButton(title: "Save Correction", systemImage: "checkmark.circle.fill", filled: true, tint: Theme.sleep) {
+                            if model.saveSleepCorrection(dayKey: summary.dayKey, sleepStart: sleepStart, sleepEnd: sleepEnd) {
+                                dismiss()
+                            }
+                        }
+
+                        if summary.sleepAdjusted {
+                            PillButton(title: "Reset to Device Data", systemImage: "arrow.uturn.backward.circle", tint: Theme.textSecondary) {
+                                if model.resetSleepCorrection(dayKey: summary.dayKey) {
+                                    dismiss()
+                                }
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .padding(.bottom, 24)
+                }
+            }
+            .navigationTitle("Sleep Correction")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Theme.bg, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() }.tint(Theme.textSecondary) }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+struct CircadianCard: View {
+    let plan: CircadianPlan
+
+    private var tint: Color {
+        switch plan.phase {
+        case .morningAdvance: return Theme.recoveryYellow
+        case .daytimeAnchor: return Theme.activity
+        case .caffeineCutoff: return Theme.temp
+        case .eveningDelayGuard: return Theme.strainHi
+        case .windDown: return Theme.sleep
+        case .sleepWindow: return Theme.hrv
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionHeader(title: "Circadian", accessory: "estimated")
+            HStack(spacing: 12) {
+                Image(systemName: plan.phase.icon)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(tint)
+                    .frame(width: 42, height: 42)
+                    .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(plan.phase.title)
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(Theme.textPrimary)
+                    Text(plan.confidence)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+                Spacer()
+            }
+
+            Text(plan.detail)
+                .font(.system(size: 14))
+                .foregroundStyle(Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineSpacing(2)
+
+            VStack(spacing: 8) {
+                if let cue = plan.nextCue {
+                    circadianRow(cue.systemImage, "Next", "\(cue.title) · \(time(cue.date))", tint)
+                }
+                circadianRow("bed.double.fill", "Sleep window", "\(time(plan.sleepStart))-\(time(plan.sleepEnd))", Theme.hrv)
+                circadianRow("cup.and.saucer.fill", "Caffeine cutoff", time(plan.caffeineCutoff), Theme.temp)
+            }
+        }
+        .padding(16)
+        .cardSurface(20)
+    }
+
+    private func circadianRow(_ icon: String, _ label: String, _ value: String, _ color: Color) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(color)
+                .frame(width: 22)
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textTertiary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+    }
+
+    private func time(_ date: Date) -> String {
+        date.formatted(.dateTime.hour().minute())
     }
 }
 
@@ -3870,8 +4651,8 @@ struct TrendsView: View {
                             TrendChartCard(title: Copy.recharge, unit: "%", data: ranged.map { ($0.date, Double($0.recoveryScore)) }, color: Theme.recoveryColor(model.today?.recoveryScore ?? 60), style: .bar, zoned: true)
                             TrendChartCard(title: "Sleep Score", unit: "%", data: ranged.map { ($0.date, Double($0.sleepScore)) }, color: Theme.sleep, style: .bar)
                             TrendChartCard(title: Copy.exertion, unit: "/21", data: ranged.map { ($0.date, Double($0.strainScore) / 100 * 21) }, color: Theme.strain, style: .area)
-                            TrendChartCard(title: "HRV", unit: "ms", data: ranged.map { ($0.date, $0.hrvMs) }, color: Theme.hrv, style: .area)
-                            TrendChartCard(title: "Resting HR", unit: "bpm", data: ranged.map { ($0.date, $0.restingHeartRate) }, color: Theme.rhr, style: .area)
+                            TrendChartCard(title: "HRV", unit: "ms", data: ranged.compactMap { $0.hrvMs > 0 ? ($0.date, $0.hrvMs) : nil }, color: Theme.hrv, style: .area)
+                            TrendChartCard(title: "Resting HR", unit: "bpm", data: ranged.compactMap { $0.restingHeartRate > 0 ? ($0.date, $0.restingHeartRate) : nil }, color: Theme.rhr, style: .area)
                             if let impact = MetricsEngine.journalImpact(tag: "late meal", summaries: model.summaries, entries: model.journalEntries) {
                                 CorrelationCard(tag: "Late Meal", delta: impact)
                             }
@@ -3914,17 +4695,27 @@ struct TrendChartCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
-                SectionHeader(title: title, accessory: "avg \(avg.formatted(.number.precision(.fractionLength(0))))\(unit)")
+                SectionHeader(title: title, accessory: points.isEmpty ? nil : "avg \(avg.formatted(.number.precision(.fractionLength(0))))\(unit)")
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(current.formatted(.number.precision(.fractionLength(unit == "ms" || unit == "bpm" ? 0 : (unit == "/21" ? 1 : 0)))))
+                Text(points.isEmpty ? "—" : current.formatted(.number.precision(.fractionLength(unit == "ms" || unit == "bpm" ? 0 : (unit == "/21" ? 1 : 0)))))
                     .font(.system(size: 34, weight: .bold, design: .rounded)).monospacedDigit()
                     .foregroundStyle(Theme.textPrimary)
-                Text(unit).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textTertiary)
+                if !points.isEmpty {
+                    Text(unit).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textTertiary)
+                }
                 Spacer()
             }
-            chart
-                .frame(height: 120)
+            if points.count < 2 {
+                Text("Not enough valid data yet.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Theme.textTertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(height: 120, alignment: .center)
+            } else {
+                chart
+                    .frame(height: 120)
+            }
         }
         .padding(16)
         .cardSurface(20)
@@ -4727,8 +5518,10 @@ struct ExportView: View {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.lowBatteryAlerts) private var lowBatteryAlerts = true
+    @AppStorage(SettingsKey.circadianAlerts) private var circadianAlerts = false
     @AppStorage(SettingsKey.tempUnitFahrenheit) private var tempF = false
 
     var body: some View {
@@ -4745,6 +5538,13 @@ struct SettingsView: View {
                             .tint(Theme.recoveryGreen)
                             .onChange(of: lowBatteryAlerts) { _, on in
                                 if on { NotificationManager.requestAuthorization() }
+                            }
+                            Toggle(isOn: $circadianAlerts) {
+                                settingLabel("Circadian cues", "Phase-aware light, caffeine, and wind-down reminders from your local sleep timing.")
+                            }
+                            .tint(Theme.hrv)
+                            .onChange(of: circadianAlerts) { _, on in
+                                model.updateCircadianAlerts(enabled: on)
                             }
                         }
                         .padding(16).cardSurface(18)
@@ -4765,7 +5565,7 @@ struct SettingsView: View {
 
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: "lock.shield.fill").font(.system(size: 12)).foregroundStyle(Theme.recoveryGreen)
-                            Text("Battery alerts are generated on this iPhone from the Loop's Bluetooth readings — nothing is sent to any server.")
+                            Text("Notifications are generated on this iPhone from Bluetooth readings and local sleep timing — nothing is sent to any server.")
                                 .font(.system(size: 12)).foregroundStyle(Theme.textTertiary)
                                 .fixedSize(horizontal: false, vertical: true).lineSpacing(1)
                         }
@@ -5215,6 +6015,10 @@ extension Date {
 
     var shortDateTime: String {
         Self.shortFormatter.string(from: self)
+    }
+
+    static func startOfDay(dayKey: String) -> Date? {
+        dayFormatter.date(from: dayKey).map { Calendar.current.startOfDay(for: $0) }
     }
 
     private static let dayFormatter: DateFormatter = {

@@ -19,10 +19,52 @@ final class MetricsEngineTests: XCTestCase {
         XCTAssertGreaterThan(MetricsEngine.recoveryScore(today: strong, history: history), MetricsEngine.recoveryScore(today: weak, history: history))
     }
 
+    func testRecoveryScoreIgnoresMissingVitalsInBaseline() {
+        var history: [DailySummary] = []
+        for offset in 1...10 {
+            history.append(summary(dayOffset: offset, recovery: 70, sleep: 78, strain: 45, rhr: 0, hrv: 0, temp: 0.0))
+        }
+        let today = summary(dayOffset: 0, recovery: 0, sleep: 82, strain: 42, rhr: 58, hrv: 64, temp: 0.0)
+
+        XCTAssertGreaterThan(MetricsEngine.recoveryScore(today: today, history: history), 55)
+    }
+
+    func testSleepConsistencyUsesCircularBedtimeDistance() {
+        var history: [DailySummary] = []
+        for offset in 1...5 {
+            var row = summary(dayOffset: offset, recovery: 70, sleep: 80, strain: 40, rhr: 58, hrv: 60, temp: 0.0)
+            row.sleepStart = Calendar.current.startOfDay(for: row.date).addingTimeInterval(23 * 3_600 + 50 * 60)
+            history.append(row)
+        }
+        let start = Calendar.current.startOfDay(for: .now).addingTimeInterval(10 * 60)
+
+        XCTAssertLessThan(MetricsEngine.sleepConsistencyDeltaMinutes(sleepStart: start, history: history), 30)
+    }
+
     func testStrainScoreUsesHeartRateLoad() {
         let easy = (0..<20).map { _ in HeartRateSample(timestamp: .now, bpm: 70, rrMs: []) }
         let hard = (0..<20).map { _ in HeartRateSample(timestamp: .now, bpm: 142, rrMs: []) }
         XCTAssertGreaterThan(MetricsEngine.strainScore(samples: hard, restingHeartRate: 55), MetricsEngine.strainScore(samples: easy, restingHeartRate: 55))
+    }
+
+    func testCircadianPlanUsesRecentSleepAnchors() throws {
+        let calendar = Calendar.current
+        let base = calendar.date(from: DateComponents(year: 2026, month: 6, day: 5, hour: 10))!
+        var rows: [DailySummary] = []
+        for offset in 0..<7 {
+            let day = calendar.date(byAdding: .day, value: -offset, to: calendar.startOfDay(for: base))!
+            var row = summary(dayOffset: offset, recovery: 75, sleep: 82, strain: 35, rhr: 57, hrv: 65, temp: 0.0)
+            row.date = day
+            row.dayKey = day.dayKey
+            row.sleepStart = day.addingTimeInterval(-45 * 60)
+            row.sleepEnd = day.addingTimeInterval(7 * 3_600 + 15 * 60)
+            rows.append(row)
+        }
+
+        let plan = try XCTUnwrap(CircadianEngine.plan(summaries: rows, now: base))
+
+        XCTAssertEqual(plan.phase, .daytimeAnchor)
+        XCTAssertEqual(Calendar.current.component(.hour, from: plan.caffeineCutoff), 17)
     }
 }
 
@@ -53,6 +95,66 @@ final class LocalStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: json.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: csv.path))
         XCTAssertTrue(try String(contentsOf: csv).contains("recovery"))
+    }
+
+    func testHeartRateDayQueryUsesRequestedDayAndLimit() throws {
+        let store = try LocalStore.temporary()
+        let start = Calendar.current.startOfDay(for: .now)
+        let target = start.dayKey
+        var samples: [HeartRateSample] = []
+        for minute in 0..<900 {
+            samples.append(HeartRateSample(timestamp: start.addingTimeInterval(Double(minute) * 60), bpm: 60 + minute % 40, rrMs: []))
+        }
+        samples.append(HeartRateSample(timestamp: start.addingTimeInterval(-3_600), bpm: 101, rrMs: []))
+        try store.save(samples)
+
+        let fetched = try store.fetchHeartRateSamples(onDay: target, limit: 600)
+
+        XCTAssertEqual(fetched.count, 600)
+        XCTAssertTrue(fetched.allSatisfy { $0.timestamp.dayKey == target })
+        XCTAssertEqual(fetched.first?.timestamp, start.addingTimeInterval(300 * 60))
+    }
+
+    func testSeedRefreshesLegacySampleDataWithoutSleepAnchors() throws {
+        let store = try LocalStore.temporary()
+        let legacy = summary(dayOffset: 0, recovery: 70, sleep: 80, strain: 45, rhr: 58, hrv: 60, temp: 0.0)
+        try store.save([legacy], source: "sample")
+
+        try store.seedIfNeeded()
+
+        let rows = try store.fetchDailySummaries(limit: 40)
+        XCTAssertGreaterThan(rows.count, 20)
+        XCTAssertTrue(rows.allSatisfy { $0.sleepStart != nil && $0.sleepEnd != nil })
+    }
+
+    func testSleepCorrectionAppliesWithoutMutatingRawSummary() throws {
+        let store = try LocalStore.temporary()
+        let start = Calendar.current.startOfDay(for: .now).addingTimeInterval(-45 * 60)
+        let end = start.addingTimeInterval(405 * 60)
+        var daily = summary(dayOffset: 0, recovery: 70, sleep: 80, strain: 45, rhr: 58, hrv: 60, temp: 0.0)
+        daily.sleepStart = start
+        daily.sleepEnd = end
+        daily.sleepMinutes = 405
+        try store.save([daily])
+
+        let correctedStart = start.addingTimeInterval(-30 * 60)
+        let correctedEnd = end.addingTimeInterval(45 * 60)
+        try store.save(SleepCorrection(dayKey: daily.dayKey, sleepStart: correctedStart, sleepEnd: correctedEnd))
+
+        let adjusted = try XCTUnwrap(store.fetchDailySummaries(limit: 1).first)
+        let raw = try XCTUnwrap(store.fetchDailySummaries(limit: 1, applyingSleepCorrections: false).first)
+
+        XCTAssertTrue(adjusted.sleepAdjusted)
+        XCTAssertEqual(adjusted.sleepMinutes, 480)
+        XCTAssertEqual(adjusted.rawSleepMinutes, 405)
+        XCTAssertEqual(adjusted.rawSleepStart, start)
+        XCTAssertEqual(raw.sleepMinutes, 405)
+        XCTAssertFalse(raw.sleepAdjusted)
+
+        try store.deleteSleepCorrection(dayKey: daily.dayKey)
+        let reset = try XCTUnwrap(store.fetchDailySummaries(limit: 1).first)
+        XCTAssertFalse(reset.sleepAdjusted)
+        XCTAssertEqual(reset.sleepMinutes, 405)
     }
 }
 
