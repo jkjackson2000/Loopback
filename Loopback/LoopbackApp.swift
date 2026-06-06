@@ -1925,14 +1925,127 @@ final class LocalStore {
     }
 
     private static func defaultURL() throws -> URL {
-        let directory = try FileManager.default.url(
+        let supportDirectory = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true
-        ).appendingPathComponent("Loopback", isDirectory: true)
+        )
+        let directory = supportDirectory.appendingPathComponent("Loopback", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory.appendingPathComponent("loopback.sqlite")
+        let currentURL = directory.appendingPathComponent("loopback.sqlite")
+        let legacyURL = supportDirectory
+            .appendingPathComponent("PolarLoopLocal", isDirectory: true)
+            .appendingPathComponent("polar_loop_local.sqlite")
+        try migrateLegacyDatabaseIfNeeded(currentURL: currentURL, legacyURL: legacyURL)
+        return currentURL
+    }
+
+    /// Older device installs wrote to `Application Support/PolarLoopLocal/polar_loop_local.sqlite`.
+    /// Preserve that local-first data when the renamed app starts using the Loopback path.
+    @discardableResult
+    static func migrateLegacyDatabaseIfNeeded(currentURL: URL, legacyURL: URL) throws -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: legacyURL.path) else { return false }
+
+        let current = databaseSnapshot(at: currentURL)
+        let legacy = databaseSnapshot(at: legacyURL)
+        let currentHasUserData = current.realDailyRows > 0
+            || current.realHeartRateRows > 0
+            || current.sleepCorrections > 0
+            || current.userJournalRows > 0
+        let legacyIsRicher = legacy.realDailyRows > current.realDailyRows
+            || legacy.realHeartRateRows > current.realHeartRateRows
+            || (!current.hasLastDeviceId && legacy.hasLastDeviceId)
+        guard !currentHasUserData, legacyIsRicher else { return false }
+
+        try fm.createDirectory(at: currentURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        for suffix in ["", "-wal", "-shm"] {
+            let source = URL(fileURLWithPath: legacyURL.path + suffix)
+            let destination = URL(fileURLWithPath: currentURL.path + suffix)
+            if fm.fileExists(atPath: destination.path) {
+                try fm.removeItem(at: destination)
+            }
+            if fm.fileExists(atPath: source.path) {
+                try fm.copyItem(at: source, to: destination)
+            }
+        }
+        return true
+    }
+
+    private struct DatabaseSnapshot {
+        var realDailyRows = 0
+        var realHeartRateRows = 0
+        var sleepCorrections = 0
+        var userJournalRows = 0
+        var hasLastDeviceId = false
+    }
+
+    private static func databaseSnapshot(at url: URL) -> DatabaseSnapshot {
+        guard FileManager.default.fileExists(atPath: url.path) else { return DatabaseSnapshot() }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            sqlite3_close(db)
+            return DatabaseSnapshot()
+        }
+        defer { sqlite3_close(db) }
+
+        var snapshot = DatabaseSnapshot()
+        if tableExists("daily_summaries", in: db) {
+            if columnExists("source", table: "daily_summaries", in: db) {
+                snapshot.realDailyRows = queryInt("SELECT COUNT(*) FROM daily_summaries WHERE source != 'sample';", in: db)
+            } else {
+                snapshot.realDailyRows = queryInt("SELECT COUNT(*) FROM daily_summaries;", in: db)
+            }
+        }
+        if tableExists("heart_rate_samples", in: db) {
+            if columnExists("source", table: "heart_rate_samples", in: db) {
+                snapshot.realHeartRateRows = queryInt("SELECT COUNT(*) FROM heart_rate_samples WHERE source != 'sample';", in: db)
+            } else {
+                snapshot.realHeartRateRows = queryInt("SELECT COUNT(*) FROM heart_rate_samples;", in: db)
+            }
+        }
+        if tableExists("sleep_corrections", in: db) {
+            snapshot.sleepCorrections = queryInt("SELECT COUNT(*) FROM sleep_corrections;", in: db)
+        }
+        if tableExists("journal_entries", in: db) {
+            snapshot.userJournalRows = queryInt("SELECT COUNT(*) FROM journal_entries WHERE note != 'Mock context';", in: db)
+        }
+        if tableExists("meta", in: db) {
+            snapshot.hasLastDeviceId = !(queryString("SELECT value FROM meta WHERE key = 'last_device_id' LIMIT 1;", in: db) ?? "").isEmpty
+        }
+        return snapshot
+    }
+
+    private static func tableExists(_ table: String, in db: OpaquePointer?) -> Bool {
+        queryInt("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '\(table)';", in: db) > 0
+    }
+
+    private static func columnExists(_ column: String, table: String, in db: OpaquePointer?) -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let pointer = sqlite3_column_text(statement, 1) else { continue }
+            if String(cString: pointer) == column { return true }
+        }
+        return false
+    }
+
+    private static func queryInt(_ sql: String, in db: OpaquePointer?) -> Int {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private static func queryString(_ sql: String, in db: OpaquePointer?) -> String? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW, let pointer = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: pointer)
     }
 
     private func execute(_ sql: String) throws {

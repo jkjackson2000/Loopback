@@ -156,6 +156,57 @@ final class LocalStoreTests: XCTestCase {
         XCTAssertFalse(reset.sleepAdjusted)
         XCTAssertEqual(reset.sleepMinutes, 405)
     }
+
+    func testLegacyDatabaseMigratesWhenCurrentHasNoRealData() throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("loopback-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let legacyURL = temp.appendingPathComponent("polar_loop_local.sqlite")
+        let currentURL = temp.appendingPathComponent("loopback.sqlite")
+
+        do {
+            let legacy = try LocalStore(url: legacyURL)
+            try legacy.setMeta("last_device_id", value: "126A4036")
+            try legacy.save([summary(dayOffset: 0, recovery: 72, sleep: 82, strain: 44, rhr: 57, hrv: 64, temp: 0.0)])
+            try legacy.save([HeartRateSample(timestamp: .now, bpm: 68, rrMs: [])])
+        }
+        do {
+            let current = try LocalStore(url: currentURL)
+            try current.save([summary(dayOffset: 3, recovery: 61, sleep: 70, strain: 52, rhr: 61, hrv: 48, temp: 0.0)], source: "sample")
+        }
+
+        XCTAssertTrue(try LocalStore.migrateLegacyDatabaseIfNeeded(currentURL: currentURL, legacyURL: legacyURL))
+
+        let migrated = try LocalStore(url: currentURL)
+        XCTAssertEqual(try migrated.getMeta("last_device_id"), "126A4036")
+        XCTAssertEqual(try migrated.fetchDailySummaries(limit: 10).count, 1)
+        XCTAssertEqual(try migrated.fetchHeartRateSamples(limit: 10).count, 1)
+    }
+
+    func testLegacyDatabaseDoesNotReplaceCurrentRealData() throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("loopback-migration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let legacyURL = temp.appendingPathComponent("polar_loop_local.sqlite")
+        let currentURL = temp.appendingPathComponent("loopback.sqlite")
+
+        do {
+            let legacy = try LocalStore(url: legacyURL)
+            try legacy.setMeta("last_device_id", value: "legacy")
+            try legacy.save([summary(dayOffset: 2, recovery: 70, sleep: 80, strain: 45, rhr: 58, hrv: 60, temp: 0.0)])
+        }
+        do {
+            let current = try LocalStore(url: currentURL)
+            try current.setMeta("last_device_id", value: "current")
+            try current.save([summary(dayOffset: 0, recovery: 84, sleep: 90, strain: 30, rhr: 52, hrv: 78, temp: 0.0)])
+        }
+
+        XCTAssertFalse(try LocalStore.migrateLegacyDatabaseIfNeeded(currentURL: currentURL, legacyURL: legacyURL))
+
+        let unchanged = try LocalStore(url: currentURL)
+        XCTAssertEqual(try unchanged.getMeta("last_device_id"), "current")
+        XCTAssertEqual(try unchanged.fetchDailySummaries(limit: 1).first?.recoveryScore, 84)
+    }
 }
 
 final class MockPolarClientTests: XCTestCase {
